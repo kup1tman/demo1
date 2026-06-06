@@ -1,0 +1,300 @@
+SQL ЗАПРОСЫ
+
+1. ИНИЦИАЛИЗАЦИЯ СХЕМЫ (init_schema)
+
+-- Проверка существования таблицы categories
+SELECT to_regclass('public.categories')
+
+-- Удаление старых таблиц (если новой схемы нет)
+DROP TABLE IF EXISTS order_products, orders, products,
+    pickup_points, order_statuses, users, roles,
+    categories, manufacturers, suppliers CASCADE
+
+-- Создание справочных таблиц
+CREATE TABLE IF NOT EXISTS roles (
+    id   SERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL
+)
+
+CREATE TABLE IF NOT EXISTS categories (
+    id   SERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL
+)
+
+CREATE TABLE IF NOT EXISTS manufacturers (
+    id   SERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL
+)
+
+CREATE TABLE IF NOT EXISTS suppliers (
+    id   SERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL
+)
+
+CREATE TABLE IF NOT EXISTS pickup_points (
+    id      SERIAL PRIMARY KEY,
+    address TEXT NOT NULL
+)
+
+CREATE TABLE IF NOT EXISTS order_statuses (
+    id   SERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL
+)
+
+-- Создание таблицы пользователей
+CREATE TABLE IF NOT EXISTS users (
+    id       SERIAL PRIMARY KEY,
+    role_id  INTEGER REFERENCES roles(id),
+    fio      TEXT NOT NULL,
+    login    TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL
+)
+
+-- Создание таблицы товаров
+CREATE TABLE IF NOT EXISTS products (
+    id              SERIAL PRIMARY KEY,
+    article         TEXT UNIQUE,
+    name            TEXT NOT NULL,
+    category_id     INTEGER REFERENCES categories(id),
+    manufacturer_id INTEGER REFERENCES manufacturers(id),
+    supplier_id     INTEGER REFERENCES suppliers(id),
+    description     TEXT,
+    price           NUMERIC(10, 2) NOT NULL DEFAULT 0 CHECK (price >= 0),
+    discount        INTEGER        NOT NULL DEFAULT 0 CHECK (discount >= 0),
+    unit            TEXT,
+    stock           INTEGER        NOT NULL DEFAULT 0 CHECK (stock >= 0),
+    photo           TEXT
+)
+
+-- Создание таблицы заказов
+CREATE TABLE IF NOT EXISTS orders (
+    id              SERIAL PRIMARY KEY,
+    article         TEXT,
+    status_id       INTEGER REFERENCES order_statuses(id),
+    pickup_point_id INTEGER REFERENCES pickup_points(id),
+    client_fio      TEXT,
+    pickup_code     TEXT,
+    order_date      DATE,
+    delivery_date   DATE
+)
+
+-- Создание связующей таблицы заказ-товар
+CREATE TABLE IF NOT EXISTS order_products (
+    order_id   INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+    product_id INTEGER REFERENCES products(id),
+    count      INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (order_id, product_id)
+)
+
+-- Заполнение стандартных статусов
+INSERT INTO order_statuses(name) VALUES (%s)
+ON CONFLICT (name) DO NOTHING
+-- значения: 'Новый', 'В обработке', 'В пути', 'Готов к выдаче', 'Завершен', 'Отменён'
+
+------------------------------------------------------------
+2. ВСПОМОГАТЕЛЬНЫЙ МЕТОД _lookup_id
+------------------------------------------------------------
+
+-- Поиск записи по имени в справочнике
+SELECT id FROM {table} WHERE {column} = %s
+
+-- Вставка новой записи в справочник
+INSERT INTO {table}({column}) VALUES (%s) RETURNING id
+
+------------------------------------------------------------
+3. ПРОВЕРКА ПУСТОТЫ ТАБЛИЦЫ (_is_empty)
+------------------------------------------------------------
+
+SELECT COUNT(*) FROM {table}
+
+------------------------------------------------------------
+4. ИМПОРТ ПОЛЬЗОВАТЕЛЕЙ (import_users)
+------------------------------------------------------------
+
+INSERT INTO users(role_id, fio, login, password)
+VALUES (%s, %s, %s, %s)
+ON CONFLICT (login) DO NOTHING
+
+------------------------------------------------------------
+5. ИМПОРТ ПУНКТОВ ВЫДАЧИ (import_pickup_points)
+------------------------------------------------------------
+
+INSERT INTO pickup_points(address) VALUES (%s)
+
+------------------------------------------------------------
+6. ИМПОРТ ТОВАРОВ (import_products)
+------------------------------------------------------------
+
+INSERT INTO products(article, name, category_id, manufacturer_id, supplier_id,
+    description, price, discount, unit, stock, photo)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (article) DO NOTHING
+
+------------------------------------------------------------
+7. ИМПОРТ ЗАКАЗОВ (import_orders)
+------------------------------------------------------------
+
+-- Получение пунктов выдачи
+SELECT id, address FROM pickup_points ORDER BY id
+
+-- Вставка заказа
+INSERT INTO orders(article, status_id, pickup_point_id,
+    client_fio, pickup_code, order_date, delivery_date)
+VALUES (%s, %s, %s, %s, %s, %s, %s)
+RETURNING id
+
+------------------------------------------------------------
+8. СИНХРОНИЗАЦИЯ ТОВАРОВ ЗАКАЗА (_sync_order_products)
+------------------------------------------------------------
+
+-- Удаление старых связей
+DELETE FROM order_products WHERE order_id = %s
+
+-- Поиск товара по артикулу
+SELECT id FROM products WHERE article = %s
+
+-- Вставка / обновление связи заказ-товар
+INSERT INTO order_products(order_id, product_id, count)
+VALUES (%s, %s, %s)
+ON CONFLICT (order_id, product_id)
+DO UPDATE SET count = EXCLUDED.count
+
+------------------------------------------------------------
+9. АУТЕНТИФИКАЦИЯ (authenticate)
+------------------------------------------------------------
+
+SELECT u.id, r.name, u.fio
+FROM users u
+LEFT JOIN roles r ON r.id = u.role_id
+WHERE u.login = %s AND u.password = %s
+
+------------------------------------------------------------
+10. ПОЛУЧЕНИЕ ТОВАРОВ (get_products)
+------------------------------------------------------------
+
+-- Базовый SELECT (без фильтров)
+SELECT p.id, p.article, p.name, c.name AS category, p.description,
+    m.name AS manufacturer, s.name AS supplier, p.price, p.discount,
+    p.unit, p.stock, p.photo
+FROM products p
+LEFT JOIN categories c ON c.id = p.category_id
+LEFT JOIN manufacturers m ON m.id = p.manufacturer_id
+LEFT JOIN suppliers s ON s.id = p.supplier_id
+ORDER BY p.id
+
+-- С поиском по тексту (добавляется WHERE)
+WHERE (p.article ILIKE %s OR p.name ILIKE %s OR c.name ILIKE %s
+    OR p.description ILIKE %s OR m.name ILIKE %s OR s.name ILIKE %s
+    OR p.unit ILIKE %s)
+
+-- С фильтром по поставщику
+AND s.name = %s
+
+-- С сортировкой по цене или остатку
+ORDER BY p.{price|stock} {ASC|DESC}, p.id
+
+------------------------------------------------------------
+11. ПОЛУЧЕНИЕ ОДНОГО ТОВАРА (get_product)
+------------------------------------------------------------
+
+SELECT p.id, p.article, p.name, c.name AS category, p.description,
+    m.name AS manufacturer, s.name AS supplier, p.price, p.discount,
+    p.unit, p.stock, p.photo
+FROM products p
+LEFT JOIN categories c ON c.id = p.category_id
+LEFT JOIN manufacturers m ON m.id = p.manufacturer_id
+LEFT JOIN suppliers s ON s.id = p.supplier_id
+WHERE p.id = %s
+
+------------------------------------------------------------
+12. СПРАВОЧНИКИ (get_categories / get_suppliers)
+------------------------------------------------------------
+
+SELECT name FROM categories ORDER BY name
+
+SELECT name FROM suppliers ORDER BY name
+
+------------------------------------------------------------
+13. ДОБАВЛЕНИЕ ТОВАРА (add_product)
+------------------------------------------------------------
+
+INSERT INTO products(article, name, category_id, manufacturer_id, supplier_id,
+    description, price, discount, unit, stock, photo)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+RETURNING id
+
+------------------------------------------------------------
+14. ОБНОВЛЕНИЕ ТОВАРА (update_product)
+------------------------------------------------------------
+
+UPDATE products
+SET article = %s, name = %s, category_id = %s, manufacturer_id = %s,
+    supplier_id = %s, description = %s, price = %s, discount = %s,
+    unit = %s, stock = %s, photo = %s
+WHERE id = %s
+
+------------------------------------------------------------
+15. ПРОВЕРКА ТОВАРА В ЗАКАЗАХ (is_product_in_order)
+------------------------------------------------------------
+
+SELECT 1
+FROM order_products op
+JOIN products p ON p.id = op.product_id
+WHERE p.article = %s
+LIMIT 1
+
+------------------------------------------------------------
+16. УДАЛЕНИЕ ТОВАРА (delete_product)
+------------------------------------------------------------
+
+DELETE FROM products WHERE id = %s
+
+------------------------------------------------------------
+17. ПУНКТЫ ВЫДАЧИ И СТАТУСЫ (get_pickup_points / get_statuses)
+------------------------------------------------------------
+
+SELECT address FROM pickup_points ORDER BY id
+
+SELECT name FROM order_statuses ORDER BY id
+
+------------------------------------------------------------
+18. ПОЛУЧЕНИЕ ЗАКАЗОВ (get_orders / get_order)
+------------------------------------------------------------
+
+-- Все заказы
+SELECT o.id, o.article, st.name AS status, pp.address AS pickup_address,
+    o.client_fio, o.pickup_code, o.order_date, o.delivery_date
+FROM orders o
+LEFT JOIN order_statuses st ON st.id = o.status_id
+LEFT JOIN pickup_points pp ON pp.id = o.pickup_point_id
+ORDER BY o.id
+
+-- Один заказ
+WHERE o.id = %s
+
+------------------------------------------------------------
+19. ДОБАВЛЕНИЕ ЗАКАЗА (add_order)
+------------------------------------------------------------
+
+INSERT INTO orders(article, status_id, pickup_point_id,
+    client_fio, pickup_code, order_date, delivery_date)
+VALUES (%s, %s, %s, %s, %s, %s, %s)
+RETURNING id
+
+------------------------------------------------------------
+20. ОБНОВЛЕНИЕ ЗАКАЗА (update_order)
+------------------------------------------------------------
+
+UPDATE orders
+SET article = %s, status_id = %s, pickup_point_id = %s,
+    client_fio = %s, pickup_code = %s, order_date = %s, delivery_date = %s
+WHERE id = %s
+
+------------------------------------------------------------
+21. УДАЛЕНИЕ ЗАКАЗА (delete_order)
+------------------------------------------------------------
+
+DELETE FROM orders WHERE id = %s
+
+  ИТОГО: 21 группа запросов, 35+ уникальных SQL-выражений
+
